@@ -69,7 +69,7 @@ func (s *Subscription) readMessage() *Message {
 	var err error
 	var rs string
 	m := new(Message)
-	r := s.c.read()
+	r, _ := s.c.read()
 
 	if r.Type != ReplyMulti || len(r.Elems) < 3 {
 		goto Err

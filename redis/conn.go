@@ -103,10 +103,18 @@ func (c *conn) init() *Error {
 
 // call calls a Redis command.
 func (c *conn) call(cmd Cmd, args ...interface{}) (r *Reply) {
-	if err := c.writeRequest(call{cmd, args}); err != nil {
-		r = &Reply{Type: ReplyError, Err: err}
-	} else {
-		r = c.read()
+	first := true
+	retry := true
+	for retry {
+		if err := c.writeRequest(call{cmd, args}); err != nil {
+			r = &Reply{Type: ReplyError, Err: err}
+		} else {
+			r, retry = c.read()
+			if !first {
+				retry = false
+			}
+		}
+		first = false
 	}
 
 	return r
@@ -115,17 +123,27 @@ func (c *conn) call(cmd Cmd, args ...interface{}) (r *Reply) {
 // multiCall calls multiple Redis commands.
 func (c *conn) multiCall(cmds []call) (r *Reply) {
 	r = new(Reply)
-	if err := c.writeRequest(cmds...); err == nil {
-		r.Type = ReplyMulti
-		r.Elems = make([]*Reply, len(cmds))
-		for i := range cmds {
-			reply := c.read()
-			r.Elems[i] = reply
+	first := true
+	retry := true
+	for retry {
+		if err := c.writeRequest(cmds...); err == nil {
+			r.Type = ReplyMulti
+			r.Elems = make([]*Reply, len(cmds))
+			for i := range cmds {
+				reply, retri := c.read()
+				if i == 0 {
+					retry = retri
+				}
+				r.Elems[i] = reply
+			}
+			if !first {
+				retry = false
+			}
+		} else {
+			r.Err = newError(err.Error())
 		}
-	} else {
-		r.Err = newError(err.Error())
+		first = false
 	}
-
 	return r
 }
 
@@ -201,7 +219,7 @@ func (c *conn) closed() bool {
 }
 
 // helper for read()
-func (c *conn) readErrHdlr(err error) (r *Reply) {
+func (c *conn) readErrHdlr(err error) (r *Reply, retry bool) {
 	if err != nil {
 		c.close()
 		err_, ok := err.(net.Error)
@@ -210,20 +228,20 @@ func (c *conn) readErrHdlr(err error) (r *Reply) {
 				Type: ReplyError,
 				Err: newError("read failed, timeout error: "+err.Error(), ErrorConnection,
 					ErrorTimeout),
-			}
+			}, false
 		}
 
 		return &Reply{
 			Type: ReplyError,
 			Err:  newError("read failed: "+err.Error(), ErrorConnection),
-		}
+		}, true
 	}
 
-	return nil
+	return nil, false
 }
 
 // read reads data from the connection and returns a Reply.
-func (c *conn) read() (r *Reply) {
+func (c *conn) read() (r *Reply, retry bool) {
 	var err error
 	var b []byte
 	r = new(Reply)
@@ -232,8 +250,8 @@ func (c *conn) read() (r *Reply) {
 		c.setReadTimeout()
 	}
 	b, err = c.reader.ReadBytes('\n')
-	if re := c.readErrHdlr(err); re != nil {
-		return re
+	if re, retry := c.readErrHdlr(err); re != nil {
+		return re, retry
 	}
 
 	// Analyze the first byte.
@@ -289,8 +307,8 @@ func (c *conn) read() (r *Reply) {
 						c.setReadTimeout()
 					}
 					n, err := c.reader.Read(br[rc:])
-					if re := c.readErrHdlr(err); re != nil {
-						return re
+					if re, retry := c.readErrHdlr(err); re != nil {
+						return re, retry
 					}
 
 					rc += n
@@ -318,7 +336,7 @@ func (c *conn) read() (r *Reply) {
 				r.Type = ReplyMulti
 				r.Elems = make([]*Reply, i)
 				for i := range r.Elems {
-					r.Elems[i] = c.read()
+					r.Elems[i], _ = c.read()
 				}
 			default:
 				// invalid reply
@@ -332,7 +350,7 @@ func (c *conn) read() (r *Reply) {
 		r.Err = newError("received invalid reply", ErrorInvalid)
 	}
 
-	return r
+	return r, false
 }
 
 func (c *conn) writeRequest(calls ...call) *Error {
